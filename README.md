@@ -1,5 +1,7 @@
 # calTUI
 
+![calTUI showing its responsive calendar and agenda](assets/caltui-screenshot.png)
+
 **A calendar that knows its place.**
 
 Can you create events? Nope.
@@ -27,11 +29,6 @@ Sometimes you don't need to manage your calendar. You just need to read the damn
 - Keyboard navigation and clickable calendar dates.
 - JSON CLI for scripts and native Waybar JSON integration.
 - No background service. It reads calendars when you run it. Revolutionary restraint.
-
-## Screenshots
-
-Screenshots will go here. None are included yet; run `caltui --demo` to see the
-actual interface in your own terminal, with your own colors.
 
 ## Requirements
 
