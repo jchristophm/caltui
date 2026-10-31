@@ -1,0 +1,29 @@
+# Python artifacts and environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local configuration, credentials, and calendar data
+config.toml
+config.local.toml
+*.ics
+*.ical
+.cache/
+cache/
+.config/
+.env
+.env.*
+*.pem
+*.key
+
+# Local editor and backup files
+*.swp
+*.swo
+*~
+*.backup-*
+.DS_Store

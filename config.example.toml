@@ -1,0 +1,24 @@
+# Add a private ICS subscription URL from your calendar provider.
+# URLs must use https://. Treat a private URL like a password: it may grant
+# anyone who has it access to your calendar. Never commit or share it publicly.
+# Empty URLs are ignored; with none configured, the TUI shows demo events.
+
+[[calendars]]
+url = ""
+
+# Add another subscription by repeating the calendar block:
+# [[calendars]]
+# url = ""
+
+# Local event-processing window around the system's local date.
+# Each value accepts integers from 1 to 366; these bounds limit recurrence work.
+# The last future day is included. Subscriptions still download complete feeds.
+[agenda]
+days_back = 30
+days_forward = 120
+
+# Cache freshness in minutes, shared by the TUI, --next and --waybar.
+# Accepts integers from 1 to 10080 (one week). The minimum avoids excessive
+# requests; the maximum bounds cache staleness. R forces a refresh regardless.
+[refresh]
+minutes = 30

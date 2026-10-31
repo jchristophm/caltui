@@ -1,0 +1,1155 @@
+#!/usr/bin/env python3
+"""calTUI — a read-only month calendar and paginated agenda for ICS subscriptions.
+
+Q quit; C calendar; A agenda; T today; R refresh; S settings.
+Calendar: left/right months, click a day for its agenda.
+Agenda: up/down pages, never scrolls or opens event details.
+
+Optional ~/.config/caltui/config.toml settings (existing URLs need no migration):
+[agenda]
+days_back = 30     # 1..366 days before the system local date
+days_forward = 120 # 1..366 days after today, including that final day
+[refresh]
+minutes = 30      # 1..10080 minutes; shared by TUI, --next and --waybar
+Values must be integers; booleans are rejected. Each missing key uses its default.
+The one-year bounds limit local recurrence processing; feeds download in full.
+The one-minute minimum avoids excessive requests; a week caps cache staleness.
+The TUI marks and expands this window around today, regardless of navigation.
+CLI next-event searches retain their independent horizon and --within filter.
+S reloads settings; R forces downloads. No background service is required.
+
+Dependencies: textual, icalendar, recurring-ical-events.
+Uses Foot's 16 ANSI colors via Textual's ansi_color=True.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import calendar as monthlib
+from html import escape
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+import json
+import hashlib
+import math
+import os
+import re
+import selectors
+import shlex
+import shutil
+import subprocess
+from codecs import getincrementaldecoder
+from pathlib import Path
+import sys
+import tempfile
+import time as clock
+import tomllib
+from urllib.request import Request, urlopen
+from unicodedata import category
+
+from dateutil.tz import tzlocal
+from icalendar import Calendar
+import recurring_ical_events
+from rich.text import Text
+from textual import events, work
+from textual.app import App, ComposeResult, SuspendNotSupported
+from textual.containers import Container, Grid
+from textual.widgets import Static
+from textual.message import Message
+from textual._xterm_parser import XTermParser
+
+if sys.platform == "linux":
+    from textual.drivers.linux_driver import LinuxDriver
+else:
+    LinuxDriver = None
+
+CONFIG = Path.home() / ".config/caltui/config.toml"
+CACHE = Path.home() / ".cache/caltui/calendar.ics"
+LOCAL_TZ = tzlocal()
+MAX_FEED_BYTES = 8 * 1024 * 1024
+AGENDA_DAYS_BACK = 30
+AGENDA_DAYS_FORWARD = 120
+
+
+# Query only the colors used by this UI: defaults, blue, cyan and bright white.
+PALETTE_KEYS = {"10", "11", "4;4", "4;6", "4;15"}
+COLOR_QUERY = "".join(f"\x1b]{key};?\x1b\\" for key in sorted(PALETTE_KEYS))
+RGB = tuple[int, int, int]
+
+
+def luminance(color: RGB) -> float:
+    def linear(channel: int) -> float:
+        value = channel / 255
+        return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+    return sum(weight * linear(channel) for weight, channel in
+               zip((0.2126, 0.7152, 0.0722), color))
+
+
+def contrast(first: RGB, second: RGB) -> float:
+    low, high = sorted((luminance(first), luminance(second)))
+    return (high + 0.05) / (low + 0.05)
+
+
+def blend(first: RGB, second: RGB, step: int) -> RGB:
+    return tuple(round(a + (b - a) * step / 255) for a, b in zip(first, second))
+
+
+def readable(color: RGB, background: RGB) -> RGB:
+    """Keep compliant colors; otherwise make the smallest blend toward black/white."""
+    for step in range(256):
+        candidates = [blend(color, end, step) for end in ((0, 0, 0), (255, 255, 255))]
+        for candidate in candidates:
+            if contrast(candidate, background) >= 4.5:
+                return candidate
+    raise AssertionError("Black or white must meet AA on an sRGB background")
+
+
+def text_colors(palette: dict[str, RGB]) -> dict[str, RGB]:
+    background = palette["11"]
+    primary = readable(palette["10"], background)
+    # Scan the quantized sRGB blend from background toward foreground. The first
+    # passing color is the dimmest blend, also for light terminal backgrounds.
+    secondary = next(color for step in range(256)
+                     if contrast(color := blend(background, primary, step), background) >= 4.5)
+    return {"primary": primary, "secondary": secondary,
+            "accent": readable(palette["4;6"], background),
+            "selection": readable(palette["4;15"], palette["4;4"])}
+
+
+def hex_color(color: RGB) -> str:
+    return "#%02x%02x%02x" % color
+
+
+class PaletteReport(Message):
+    def __init__(self, key: str, color: RGB) -> None:
+        super().__init__()
+        self.key, self.color = key, color
+
+
+class ColorReplies:
+    """Separate OSC replies from Textual input, including fragmented reads.
+
+    This runs inside the existing input thread; it never reads stdin itself.
+    Ordinary keys, mouse input and bracketed paste go to XTermParser unchanged.
+    Unknown OSCs are consumed too: they are terminal messages, not key presses.
+    """
+    def __init__(self, report) -> None:
+        self.report = report
+        self.pending = ""
+        self.osc = False
+        self.discard = False
+        self.tail = ""
+        self.paste = False
+        self.since = 0.0
+
+    def feed(self, data: str) -> str:
+        output = []
+        for char in data:
+            if self.osc:
+                self.pending += char
+                if char == "\a" or self.pending.endswith("\x1b\\"):
+                    if not self.discard:
+                        payload = self.pending[2:-1] if char == "\a" else self.pending[2:-2]
+                        match = re.fullmatch(r"(10|11|4;(?:4|6|15));rgb:([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})", payload)
+                        if match:
+                            key, *channels = match.groups()
+                            color = tuple(round(int(c, 16) * 255 / (16 ** len(c) - 1)) for c in channels)
+                            self.report(PaletteReport(key, color))
+                    self.pending, self.osc, self.discard = "", False, False
+                elif len(self.pending) > 256:
+                    # Bound memory for malformed input, retaining ST detection.
+                    self.pending, self.discard = self.pending[-1:], True
+                continue
+            if self.pending:
+                if char == "]" and not self.paste:
+                    self.pending += char
+                    self.osc = True
+                    self.since = clock.monotonic()
+                    continue
+                output.append(self.pending)
+                self.pending = ""
+            self.tail = (self.tail + char)[-6:]
+            if self.tail.endswith("\x1b[200~"):
+                self.paste = True
+            elif self.tail.endswith("\x1b[201~"):
+                self.paste = False
+            if char == "\x1b":
+                self.pending = char
+                self.since = clock.monotonic()
+            else:
+                output.append(char)
+        return "".join(output)
+
+    def tick(self) -> str:
+        if self.osc and clock.monotonic() - self.since >= 0.5:
+            # An unterminated response must not capture subsequent keyboard input.
+            self.pending, self.osc, self.discard = "", False, False
+        if self.pending == "\x1b" and not self.osc and clock.monotonic() - self.since >= 0.03:
+            self.pending = ""
+            return "\x1b"
+        return ""
+
+
+if LinuxDriver is not None:
+    class ColorDriver(LinuxDriver):
+        def run_input_thread(self) -> None:
+            # Textual 8 has no OSC response hook. Keep its single input reader,
+            # UTF-8 decoder and parser; intercept OSC before its key fallback.
+            parser = XTermParser(self._debug)
+            replies = ColorReplies(self.process_message)
+            decode = getincrementaldecoder("utf-8")().decode
+            with selectors.SelectSelector() as selector:
+                selector.register(self.fileno, selectors.EVENT_READ)
+                while not self.exit_event.is_set():
+                    for _key, _mask in selector.select(0.03):
+                        data = os.read(self.fileno, 4096)
+                        if not data:
+                            return
+                        filtered = replies.feed(decode(data))
+                        if filtered:
+                            for message in parser.feed(filtered):
+                                self.process_message(message)
+                    pending = replies.tick()
+                    if pending:
+                        for message in parser.feed(pending):
+                            self.process_message(message)
+                    for message in parser.tick():
+                        self.process_message(message)
+else:
+    ColorDriver = None
+
+
+def scrub(value: object) -> str:
+    """Single safe display line from potentially untrusted calendar text."""
+    return " ".join(str(value or "").split()).replace("\x1b", "")
+
+
+def shorten(text: str, width: int) -> Text:
+    result = Text(text)
+    result.truncate(max(1, width), overflow="ellipsis")
+    return result
+
+
+def month_shift(day: date, offset: int) -> date:
+    total = day.year * 12 + (day.month - 1) + offset
+    year, month = divmod(total, 12)
+    return date(year, month + 1, 1)
+
+
+def local_datetime(value: date | datetime) -> datetime:
+    if isinstance(value, datetime):
+        return (value if value.tzinfo else value.replace(tzinfo=LOCAL_TZ)).astimezone(LOCAL_TZ)
+    return datetime.combine(value, time.min, tzinfo=LOCAL_TZ)
+
+
+@dataclass(frozen=True)
+class Appointment:
+    start: datetime
+    end: datetime  # exclusive
+    all_day: bool
+    title: str
+    location: str
+    uid: str
+
+    def days(self, begin: date, stop: date) -> list[date]:
+        first = max(begin, self.start.date())
+        last = min(stop - timedelta(days=1), (self.end - timedelta(microseconds=1)).date())
+        if first > last:
+            return []
+        return [first + timedelta(days=i) for i in range((last - first).days + 1)]
+
+
+class CombinedFeed:
+    """Keep recurrence expansion isolated by source, even when UIDs coincide."""
+    def __init__(self, queries) -> None:
+        self.queries = tuple(queries)
+
+    def between(self, begin, stop):
+        return [item for query in self.queries for item in query.between(begin, stop)]
+
+
+def parse_appointments(query: object, begin: date, stop: date) -> list[Appointment]:
+    """Use recurrence-aware library (RRULE, EXDATE, RECURRENCE-ID) for a finite range."""
+    results: list[Appointment] = []
+    for item in query.between(begin, stop):
+        if str(item.get("STATUS", "")).upper() == "CANCELLED":
+            continue
+        if "DTSTART" not in item:
+            continue
+        raw_start = item.decoded("DTSTART")
+        all_day = not isinstance(raw_start, datetime)
+        if "DTEND" in item:
+            raw_end = item.decoded("DTEND")
+        elif "DURATION" in item:
+            raw_end = raw_start + item.decoded("DURATION")
+        else:
+            raw_end = raw_start + timedelta(days=1) if all_day else raw_start + timedelta(hours=1)
+        start = local_datetime(raw_start)
+        end = local_datetime(raw_end)
+        if end <= start:
+            end = start + timedelta(days=1) if all_day else start + timedelta(minutes=1)
+        if end <= local_datetime(begin) or start >= local_datetime(stop):
+            continue
+        results.append(Appointment(
+            start, end, all_day, scrub(item.get("SUMMARY", "(Untitled)")),
+            scrub(item.get("LOCATION", "")), scrub(item.get("UID", ""))
+        ))
+    return sorted(results, key=lambda x: (x.start.timestamp(), x.end.timestamp(), x.title))
+
+
+def demo_ics() -> bytes:
+    """A few representative fake events for previewing before adding a private URL."""
+    today = date.today()
+    rows = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//CalTUI demo//EN"]
+    examples = [
+        (0, 9, 0, 60, "Faculty meeting", "Science Hall"),
+        (0, 14, 30, 45, "Project review", "Conference room"),
+        (1, 10, 0, 90, "Committee meeting", ""),
+        (1, 13, 0, 60, "Department planning", "Online"),
+        (2, 8, 30, 60, "Morning check-in", ""),
+        (3, 15, 15, 30, "Quick appointment", "Office"),
+        (6, 11, 0, 45, "Weekly stand-up", ""),
+    ]
+    for i, (offset, hour, minute, duration, title, location) in enumerate(examples):
+        at = datetime.combine(today + timedelta(days=offset), time(hour, minute))
+        rows += ["BEGIN:VEVENT", f"UID:demo-{i}@caltui", "DTSTAMP:20261001T120000Z",
+                 f"DTSTART:{at:%Y%m%dT%H%M%S}",
+                 f"DTEND:{at + timedelta(minutes=duration):%Y%m%dT%H%M%S}",
+                 f"SUMMARY:{title}", f"LOCATION:{location}", "END:VEVENT"]
+    rows += ["BEGIN:VEVENT", "UID:demo-allday@caltui", "DTSTAMP:20261001T120000Z",
+             f"DTSTART;VALUE=DATE:{today + timedelta(days=4):%Y%m%d}",
+             f"DTEND;VALUE=DATE:{today + timedelta(days=5):%Y%m%d}",
+             "SUMMARY:All-day deadline", "END:VEVENT", "END:VCALENDAR"]
+    return ("\r\n".join(rows) + "\r\n").encode()
+
+
+def settings_editor() -> list[str] | None:
+    for command in (os.environ.get("VISUAL", ""), os.environ.get("EDITOR", ""), "nano", "vi"):
+        try:
+            argv = shlex.split(command)
+            executable = shutil.which(argv[0]) if argv else None
+        except (OSError, ValueError):
+            continue
+        if executable:
+            return [executable, *argv[1:]]
+    return None
+
+
+@dataclass(frozen=True)
+class Settings:
+    days_back: int = AGENDA_DAYS_BACK
+    days_forward: int = AGENDA_DAYS_FORWARD
+    minutes: int = 30
+
+    @classmethod
+    def from_config(cls, config: dict) -> Settings:
+        values = {}
+        # Cap each side at a year to bound recurrence expansion. One minute
+        # prevents sub-minute polling; one week bounds how stale feeds may be.
+        for section, key, default, maximum in (
+            ("agenda", "days_back", 30, 366),
+            ("agenda", "days_forward", 120, 366),
+            ("refresh", "minutes", 30, 10080),
+        ):
+            table = config.get(section, {})
+            if not isinstance(table, dict):
+                raise ValueError(f"{section} must be a TOML table")
+            value = table.get(key, default)
+            if type(value) is not int or not 1 <= value <= maximum:
+                raise ValueError(f"{section}.{key} must be an integer from 1 to {maximum}")
+            values[key] = value
+        return cls(**values)
+
+    def window(self) -> tuple[date, date]:
+        today = date.today()
+        return today - timedelta(days=self.days_back), today + timedelta(days=self.days_forward + 1)
+
+    def stale(self, modified: float) -> bool:
+        return max(0, clock.time() - modified) >= self.minutes * 60
+
+
+def read_config() -> tuple[list[str], str, Settings]:
+    """Configured URLs in order, plus the unambiguous owner of the old cache."""
+    if not CONFIG.is_file():
+        return [], "", Settings()
+    with CONFIG.open("rb") as handle:
+        config = tomllib.load(handle)
+    settings = Settings.from_config(config)
+    legacy = str(config.get("url", "")).strip()
+    entries = config.get("calendars", [])
+    if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+        raise ValueError("calendars must be an array of tables")
+    urls = list(dict.fromkeys(url for value in [legacy, *(entry.get("url", "") for entry in entries)]
+                              if (url := str(value).strip())))
+    if any(not url.startswith("https://") for url in urls):
+        raise ValueError("Feed URLs must begin with https://")
+    return urls, legacy or (urls[0] if len(urls) == 1 else ""), settings
+
+
+def subscription_urls() -> tuple[list[str], str]:
+    urls, legacy, _ = read_config()
+    return urls, legacy
+
+
+def cache_path(url: str | None = None) -> Path:
+    return CACHE if url is None else CACHE.parent / (hashlib.sha256(url.encode()).hexdigest() + ".ics")
+
+
+def migrate_cache(url: str) -> None:
+    """Consume the old unassigned snapshot once, without replacing a newer one."""
+    if not url or not CACHE.is_file():
+        return
+    try:
+        parse_feed(CACHE.read_bytes())
+        path = cache_path(url)
+        try:
+            os.link(CACHE, path)  # Atomic, exclusive; preserve the original mtime.
+        except FileExistsError:
+            parse_feed(path.read_bytes())
+        path.chmod(0o600)
+        CACHE.unlink()
+    except (OSError, ValueError):
+        pass  # The hashed cache or the ordinary download can still be used.
+
+
+def download_ics(url: str) -> bytes:
+    request = Request(url, headers={"User-Agent": "CalTUI/0.1", "Accept": "text/calendar, */*"})
+    with urlopen(request, timeout=15) as response:
+        data = response.read(MAX_FEED_BYTES + 1)
+    if len(data) > MAX_FEED_BYTES:
+        raise ValueError("Calendar feed is too large")
+    if b"BEGIN:VCALENDAR" not in data[:2048]:
+        raise ValueError("Subscription did not return an ICS calendar")
+    return data
+
+
+def parse_feed(data: bytes, *, timed_only: bool = False) -> object:
+    """Validate and prepare an ICS snapshot without altering the current view."""
+    calendar = Calendar.from_ical(data)
+    if calendar.name != "VCALENDAR":
+        raise ValueError("Subscription must contain an ICS calendar")
+    query = recurring_ical_events.of(calendar)
+    if not timed_only:
+        return query
+    # Avoid iterating endless all-day/cancelled recurrences in --next mode.
+    # Keep whole UID families so EXDATE and recurrence overrides still apply.
+    timed_uids = {
+        str(item.get("UID", "")) for item in calendar.subcomponents
+        if item.name == "VEVENT" and "DTSTART" in item
+        and isinstance(item.decoded("DTSTART"), datetime)
+        and str(item.get("STATUS", "")).upper() != "CANCELLED"
+    }
+    calendar.subcomponents = [
+        item for item in calendar.subcomponents
+        if item.name != "VEVENT" or str(item.get("UID", "")) in timed_uids
+    ]
+    return recurring_ical_events.of(calendar)
+
+
+def cached_feed(url: str | None = None, *, timed_only: bool = False) -> tuple[object, float]:
+    """Read the last good snapshot locally; never wait for the network."""
+    path = cache_path(url)
+    query = parse_feed(path.read_bytes(), timed_only=timed_only)
+    return query, path.stat().st_mtime
+
+
+def save_private_cache(data: bytes, url: str | None = None) -> None:
+    path = cache_path(url)
+    CACHE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, name = tempfile.mkstemp(dir=CACHE.parent, prefix=".calendar-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.chmod(name, 0o600)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def refresh_feed(url: str, *, timed_only: bool = False) -> object:
+    data = download_ics(url)
+    query = parse_feed(data, timed_only=timed_only)
+    save_private_cache(data, url)  # Parse successfully before replacing a snapshot.
+    return query
+
+
+def next_feed(demo: bool = False) -> object:
+    """Load each CLI snapshot, refreshing stale sources with independent fallback."""
+    if demo:
+        return parse_feed(demo_ics(), timed_only=True)
+    urls, legacy, settings = read_config()
+    if not urls:
+        raise ValueError("No calendar feed configured")
+    migrate_cache(legacy)
+    queries, failed = [], 0
+    for url in urls:
+        query = None
+        try:
+            query, modified = cached_feed(url, timed_only=True)
+            if not settings.stale(modified):
+                queries.append(query)
+                continue
+        except Exception:
+            pass
+        try:
+            query = refresh_feed(url, timed_only=True)
+        except Exception:
+            failed += 1
+        if query is not None:
+            queries.append(query)
+    if not queries:
+        raise ValueError("No calendars available")
+    if failed:
+        print(f"calTUI: {failed} calendar refresh failed; using available calendars and saved data", file=sys.stderr)
+    return CombinedFeed(queries)
+
+
+def next_event(query: object, now: datetime, within: float | None = None) -> dict[str, str]:
+    """Return the first future timed occurrence, without a fixed search horizon."""
+    empty = {"date": "", "time": "", "description": "", "location": ""}
+    now = local_datetime(now)
+
+    def future_items(items):
+        for item in items:
+            if str(item.get("STATUS", "")).upper() == "CANCELLED" or "DTSTART" not in item:
+                continue
+            raw_start = item.decoded("DTSTART")
+            if not isinstance(raw_start, datetime):
+                continue
+            start = local_datetime(raw_start)
+            # Compare actual instants, including across DST transitions.
+            if start.timestamp() > now.timestamp():
+                yield start, item
+
+    # Select within each recurrence context, then compare actual instants.
+    candidates = []
+    for source in query.queries if isinstance(query, CombinedFeed) else (query,):
+        candidate = next(future_items(source.after(now)), None)
+        if candidate is not None:
+            # Mixed floating/UTC times can be ordered differently by the library.
+            candidates.append(min(future_items(source.between(now, candidate[0])),
+                                  key=lambda pair: pair[0].timestamp(), default=candidate))
+    if not candidates:
+        return empty
+    start, item = min(candidates, key=lambda pair: pair[0].timestamp())
+    if within is not None and (start.timestamp() - now.timestamp()) / 60 > within:
+        return empty
+    return {
+        "date": start.date().isoformat(),
+        "time": start.strftime("%I:%M %p").lstrip("0"),
+        "description": str(item.get("SUMMARY", "")),
+        "location": str(item.get("LOCATION", "")),
+    }
+
+
+def waybar_event(result: dict[str, str], today: date) -> dict[str, str]:
+    """Format the existing next-event result for Waybar, without changing --next."""
+    if not result["date"]:
+        return {"text": "", "tooltip": "No upcoming timed appointments", "class": "empty"}
+
+    def clean(value: str) -> str:
+        # Remove complete ANSI CSI / OSC sequences before stripping controls.
+        value = re.sub(r"(?:\x1b\]|\x9d)[^\a\x1b\x9c]*(?:\a|\x1b\\|\x9c)|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[ -/]*[0-~]", "", value)
+        value = "".join(" " if char.isspace() else char
+                        for char in value if char.isspace() or category(char) not in {"Cc", "Cf", "Cs"})
+        return " ".join(value.split())
+
+    day = date.fromisoformat(result["date"])
+    when = clean(result["time"])
+    title = clean(result["description"]) or "(Untitled)"
+    location = clean(result["location"])
+    brief = title if len(title) <= 48 else title[:47] + "…"
+    prefix = "" if day == today else day.strftime("%a %b %-d · ")
+    tooltip = [day.strftime("%A, %B %-d, %Y"), when, title]
+    if location:
+        tooltip.append(location)
+    # Waybar uses Pango markup by default. Feed text must remain literal text.
+    return {"text": escape(prefix + when + " · " + brief, quote=False),
+            "tooltip": escape("\n".join(tooltip), quote=False), "class": "upcoming"}
+
+
+def positive_minutes(value: str) -> float:
+    try:
+        minutes = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("--within must be a positive number of minutes") from None
+    if not math.isfinite(minutes) or minutes <= 0:
+        raise argparse.ArgumentTypeError("--within must be a positive number of minutes")
+    return minutes
+
+
+def day_groups(items: list[Appointment], begin: date, stop: date) -> list[tuple[date, list[Appointment]]]:
+    dates: dict[date, list[Appointment]] = {}
+    for item in items:
+        for day in item.days(begin, stop):
+            dates.setdefault(day, []).append(item)
+    return sorted(dates.items())
+
+
+def event_line(item: Appointment, day: date, width: int, secondary: str = "bright_black") -> list[Text]:
+    if item.all_day:
+        when = "All day"
+    elif item.start.date() < day:
+        when = "Cont."
+    else:
+        when = item.start.strftime("%I:%M %p").lstrip("0")
+    prefix = f"{when:<10} "
+    title = shorten(item.title, width - len(prefix))
+    # Let times and titles inherit Foot's normal foreground, like calendar day numbers.
+    line = Text(prefix)
+    line.append_text(title)
+    lines = [line]
+    if item.location:
+        detail = Text(" " * 11 + "↳ ", style=secondary)
+        detail.append_text(shorten(item.location, width - 13))
+        detail.stylize(secondary)
+        lines.append(detail)
+    return lines
+
+
+def agenda_pages(groups: list[tuple[date, list[Appointment]]], height: int, width: int,
+                 starts: list | None = None, secondary: str = "bright_black",
+                 accent: str = "cyan") -> list[Text]:
+    """Fit complete appointments (including locations) on pages; never scroll."""
+    if height < 3 or width < 24:
+        return [Text("Enlarge window to view agenda", style=secondary)]
+    pages: list[Text] = []
+    current: list[Text] = []
+    used = 0
+
+    def flush() -> None:
+        nonlocal current, used
+        if current:
+            text = Text("\n").join(current)
+            text.no_wrap = True
+            text.overflow = "crop"
+            pages.append(text)
+        current, used = [], 0
+
+    for day, items in groups:
+        for index, item in enumerate(items):
+            lines = event_line(item, day, width, secondary)
+            if len(lines) + 1 > height:
+                lines = lines[:1]  # unusually short terminal: preserve event title
+            new_day = index == 0
+            # Each page containing a day starts with that day's heading.
+            heading_needed = new_day or used == 0
+            separator = 1 if new_day and used else 0
+            required = len(lines) + int(heading_needed) + separator
+            if used and used + required > height:
+                flush()
+                heading_needed, separator = True, 0
+            if not current and starts is not None:
+                starts.append((day, item.start, item.end, item.uid, item.title))
+            if separator:
+                current.append(Text(""))
+                used += 1
+            if heading_needed:
+                suffix = " (cont.)" if index > 0 else ""
+                heading = Text(day.strftime("%A, %B %-d") + suffix, style="bold " + accent)
+                current.append(heading)
+                used += 1
+            current.extend(lines)
+            used += len(lines)
+    flush()
+    return pages or [Text("No events in the selected range", style=secondary)]
+
+
+class DayCell(Static):
+    def __init__(self) -> None:
+        super().__init__("", classes="day")
+        self.day: date | None = None
+
+    def on_click(self, event: events.Click) -> None:
+        if self.day is not None:
+            event.stop()
+            self.app.open_agenda(self.day)
+
+
+class AgendaBody(Static):
+    def on_resize(self) -> None:
+        self.app.schedule_reflow()
+
+
+class CalTUI(App):
+    TITLE = "calTUI"
+    BINDINGS = [
+        ("q", "quit", "Quit"), ("c", "calendar", "Calendar"),
+        ("a", "agenda", "Agenda"), ("t", "today", "Today"),
+        ("r", "refresh_feed", "Refresh"), ("s", "settings", "Settings"),
+        ("left", "previous_month", "Previous Month"),
+        ("right", "next_month", "Next Month"),
+        ("up", "previous_page", "Previous Page"),
+        ("down", "next_page", "Next Page"),
+    ]
+    CSS = """
+    Screen { background: ansi_default; color: ansi_default; layout: vertical; }
+    #stage { height: 1fr; width: 100%; align: center middle;
+             overflow: hidden; background: ansi_default; padding-bottom: 1; }
+    #stage.cramped { padding-bottom: 0; }
+    #calendar { width: 100%; max-width: 100%; height: 16; background: ansi_default; }
+    #month { width: 100%; height: 3; content-align: center middle;
+             color: ansi_cyan; text-style: bold; }
+    #weekdays { layout: grid; grid-size: 7 1; grid-columns: 1fr;
+                width: 100%; height: 1; color: ansi_bright_black; }
+    #weekdays Static { content-align: center middle; }
+    #day-grid { layout: grid; grid-size: 7 6; grid-columns: 1fr;
+                grid-rows: 1fr; width: 100%; height: 1fr; }
+    .day { width: 100%; height: 100%; content-align: center middle;
+           background: ansi_default; color: ansi_default; }
+    .day.has-event { color: ansi_cyan; }
+    .day.today { color: ansi_bright_white; background: ansi_blue;
+                 text-style: bold; }
+    .day:hover { text-style: bold; }
+    #agenda { width: 100%; height: 100%; align: center middle;
+              overflow: hidden; background: ansi_default; }
+    #agenda-body { width: 88%; height: 100%; content-align: left middle;
+                   overflow: hidden;
+                   background: ansi_default; color: ansi_default; }
+    #stage.wide { layout: horizontal; }
+    #stage.wide #calendar { width: 2fr; height: 16; }
+    #stage.wide #agenda { width: 3fr; height: 100%; }
+    #stage.stacked { layout: vertical; }
+    #stage.stacked #agenda { height: 1fr; }
+    #stage.compact #calendar { max-height: 100%; }
+    #stage.tiny #month { height: 1; }
+    #status, #keys { text-wrap: nowrap; text-overflow: ellipsis; }
+    #status { width: 100%; height: 1; content-align: center middle;
+              color: ansi_bright_black; background: ansi_default; }
+    #keys { width: 100%; height: 1; content-align: center middle;
+            color: ansi_bright_black; background: ansi_default; }
+    """
+
+    def __init__(self, demo: bool = False, agenda: bool = False) -> None:
+        super().__init__(ansi_color=True, driver_class=ColorDriver)
+        self.secondary = "bright_black"
+        self.accent = "cyan"
+        self.palette = {}
+        self._text_colors = {}
+        self._palette_replies = {}
+        self.demo = demo
+        self.view = "agenda" if agenda else "calendar"
+        self.layout_mode = "compact"
+        self._agenda_size = None
+        self._reflow_pending = False
+        self.page_starts = []
+        self._page_position = None
+        self._reset_position = True
+        self.month = date.today().replace(day=1)
+        self.anchor = date.today()
+        self.feed_query = None
+        self.pages: list[Text] = []
+        self.page = 0
+        self.page_offset = 0  # Relative to the page starting at the selected date.
+        self.data_status = ""
+        self.feed_queries = {}
+        self.feed_modified = {}
+        self.settings = Settings()
+        self.configured_urls = []
+
+    def compose(self) -> ComposeResult:
+        with Container(id="stage"):
+            with Container(id="calendar"):
+                yield Static("", id="month")
+                with Grid(id="weekdays"):
+                    for name in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"):
+                        yield Static(name)
+                with Grid(id="day-grid"):
+                    for _ in range(42):
+                        yield DayCell()
+            with Container(id="agenda"):
+                yield AgendaBody("", id="agenda-body")
+        yield Static("", id="status")
+        yield Static("", id="keys")
+
+    def query_palette(self) -> None:
+        if ColorDriver is not None and isinstance(self._driver, ColorDriver):
+            self._palette_replies = {}
+            self._driver.write(COLOR_QUERY)
+            self._driver.flush()
+
+    def on_palette_report(self, message: PaletteReport) -> None:
+        self._palette_replies[message.key] = message.color
+        if self._palette_replies.keys() == PALETTE_KEYS:
+            palette = self._palette_replies.copy()
+            if palette != self.palette:
+                self.apply_palette(palette)
+
+    def apply_palette(self, palette: dict[str, RGB]) -> None:
+        self.palette = palette.copy()
+        self._text_colors = colors = text_colors(palette)
+        self.secondary = hex_color(colors["secondary"])
+        self.accent = hex_color(colors["accent"])
+        primary = hex_color(colors["primary"])
+        self.screen.styles.color = primary
+        for selector in ("#calendar", "#agenda", "#agenda-body", ".day"):
+            for widget in self.query(selector):
+                widget.styles.color = primary
+        for selector in ("#weekdays", "#status", "#keys"):
+            self.query_one(selector).styles.color = self.secondary
+        self.query_one("#month").styles.color = self.accent
+        self.render_view()
+
+    def on_mount(self) -> None:
+        self.query_palette()
+        self.set_interval(2, self.query_palette)
+        # Prepare the local snapshot before the first draw. Previously we
+        # downloaded first, leaving a blank calendar until HTTP completed.
+        try:
+            urls, legacy, self.settings = read_config()
+            self.configured_urls = urls
+        except (OSError, ValueError) as error:
+            if not self.demo:
+                self.data_status = f"Invalid configuration: {error}"
+                self.render_view()
+                return
+            self.notify(f"Invalid configuration: {error}; using demo defaults.", severity="error")
+            urls = []
+        if self.demo or not urls:
+            self.feed_query = parse_feed(demo_ics())
+            self.data_status = "Sample events · demo mode"
+            self.render_view()
+            return
+
+        migrate_cache(legacy)
+        for url in urls:
+            try:
+                self.feed_queries[url], self.feed_modified[url] = cached_feed(url)
+            except Exception:
+                pass
+        self.feed_query = CombinedFeed(self.feed_queries.values()) if self.feed_queries else None
+        self.data_status = (f"{len(self.feed_queries)} saved calendars" if self.feed_queries else "Loading calendar…")
+        self.render_view()
+        if any(url not in self.feed_modified or
+               self.settings.stale(self.feed_modified[url]) for url in urls):
+            self.load_feed(stale_only=True)
+
+    def on_resize(self, event: events.Resize) -> None:
+        self.call_after_refresh(self.render_view, False)
+        self.schedule_reflow()
+
+    def schedule_reflow(self) -> None:
+        if not self._reflow_pending:
+            self._reflow_pending = True
+            self.call_after_refresh(self.reflow_agenda)
+
+    def reflow_agenda(self) -> None:
+        self._reflow_pending = False
+        body = self.query_one("#agenda-body", Static)
+        if body.region and (self.layout_mode != "compact" or self.view == "agenda"):
+            size = body.content_size
+            if size != self._agenda_size or self._reset_position:
+                self._agenda_size = size
+                self.rebuild_pages()
+                self.render_view(rebuild=False)
+
+    def action_calendar(self) -> None:
+        if self.layout_mode != "compact":
+            self.view = "calendar"
+            return
+        if self.view == "agenda":
+            self.month = self.anchor.replace(day=1)
+        self.view = "calendar"
+        self.render_view()
+
+    def action_agenda(self) -> None:
+        if self.layout_mode != "compact":
+            self.view = "agenda"
+            return
+        # From a navigated month, start with that month rather than jumping to today.
+        if self.view == "calendar" and self.month != self.anchor.replace(day=1):
+            self.open_agenda(self.month)
+        else:
+            self.open_agenda(self.anchor)
+
+    def open_agenda(self, day: date) -> None:
+        self.anchor = day
+        if self.layout_mode == "compact":
+            self.view = "agenda"
+        self.page_offset = 0
+        self._reset_position = True
+        self.render_view()
+
+    def action_today(self) -> None:
+        self.anchor = date.today()
+        self.month = self.anchor.replace(day=1)
+        self.page_offset = 0
+        self._reset_position = True
+        self.render_view()
+
+    def action_previous_month(self) -> None:
+        if self.layout_mode != "compact" or self.view == "calendar":
+            self.month = month_shift(self.month, -1)
+            self.render_view()
+
+    def action_next_month(self) -> None:
+        if self.layout_mode != "compact" or self.view == "calendar":
+            self.month = month_shift(self.month, 1)
+            self.render_view()
+
+    def action_previous_page(self) -> None:
+        if (self.layout_mode != "compact" or self.view == "agenda") and self.page > 0:
+            self.page -= 1
+            self.page_offset -= 1
+            self.render_view(rebuild=False)
+
+    def action_next_page(self) -> None:
+        if (self.layout_mode != "compact" or self.view == "agenda") and self.page + 1 < len(self.pages):
+            self.page += 1
+            self.page_offset += 1
+            self.render_view(rebuild=False)
+
+    def action_settings(self) -> None:
+        command = settings_editor()
+        if command is None:
+            self.notify("No terminal editor found. Set VISUAL or EDITOR, or install nano or vi.", severity="warning")
+            return
+        try:
+            before = CONFIG.read_bytes() if CONFIG.is_file() else None
+        except OSError:
+            self.notify("Could not read config.toml; check its permissions.", severity="error")
+            return
+        completed = None
+        try:
+            with self.suspend():
+                # Catch failures here so Textual reaches its terminal-resume code.
+                try:
+                    completed = subprocess.run([*command, str(CONFIG)], check=False)
+                except (OSError, ValueError, KeyboardInterrupt):
+                    pass
+        except SuspendNotSupported:
+            self.notify("Settings requires a terminal that supports suspending calTUI.", severity="warning")
+            return
+        if completed is None:
+            self.notify("Could not run the settings editor. Check VISUAL or EDITOR.", severity="error")
+            return
+        if completed.returncode:
+            self.notify(f"Settings editor exited with status {completed.returncode}.", severity="warning")
+        try:
+            after = CONFIG.read_bytes() if CONFIG.is_file() else None
+            if after == before:
+                return
+            urls, _, settings = read_config()
+        except (OSError, ValueError) as error:
+            self.notify(f"Invalid configuration: {error}; keeping loaded settings and calendars.", severity="error")
+            return
+        previous = self.settings
+        urls_changed = set(urls) != set(self.configured_urls)
+        self.settings = settings
+        self.configured_urls = urls
+        if (previous.days_back, previous.days_forward) != (settings.days_back, settings.days_forward):
+            self.render_view()
+        if not self.demo and (urls_changed or previous.minutes != settings.minutes):
+            self.load_feed(stale_only=True)
+
+    def action_refresh_feed(self) -> None:
+        if self.demo:
+            self.data_status = "Sample events · demo mode"
+            self.render_view()
+            return
+        self.load_feed()
+
+    @work(exclusive=True, group="feed")
+    async def load_feed(self, stale_only: bool = False) -> None:
+        try:
+            urls, legacy, settings = read_config()
+        except (OSError, ValueError) as error:
+            self.data_status = f"Invalid configuration: {error}"
+            self.render_view()
+            return
+        self.settings = settings
+        self.configured_urls = urls
+        migrate_cache(legacy)
+        # Re-read subscriptions on R. Removed sources cease contributing at once.
+        self.feed_queries = {url: query for url, query in self.feed_queries.items() if url in urls}
+        self.feed_modified = {url: modified for url, modified in self.feed_modified.items() if url in urls}
+        for url in urls:
+            if url not in self.feed_queries:
+                try:
+                    query, modified = await asyncio.to_thread(cached_feed, url)
+                    self.feed_queries[url], self.feed_modified[url] = query, modified
+                except Exception:
+                    pass
+        self.feed_query = CombinedFeed(self.feed_queries.values()) if self.feed_queries else None
+        if not urls:
+            self.feed_query = parse_feed(demo_ics())
+            self.data_status = "Sample events · demo mode"
+            self.render_view()
+            return
+        self.data_status = "Checking calendars for updates…"
+        self.render_view()
+        updated, failed = 0, 0
+
+        async def refresh(url: str) -> None:
+            nonlocal updated, failed
+            try:
+                query = await asyncio.to_thread(refresh_feed, url)
+                self.feed_queries[url] = query
+                self.feed_modified[url] = clock.time()
+                updated += 1
+                self.feed_query = CombinedFeed(self.feed_queries.values())
+                self.render_view()
+            except Exception:
+                failed += 1
+
+        pending = [url for url in urls if not stale_only or url not in self.feed_modified or
+                   self.settings.stale(self.feed_modified[url])]
+        await asyncio.gather(*(refresh(url) for url in pending))
+        cached = len(self.feed_queries) - updated
+        unavailable = len(urls) - len(self.feed_queries)
+        parts = [f"{updated} calendars updated"] if updated else []
+        if cached:
+            parts.append(f"{cached} using cache")
+        if unavailable:
+            parts.append(f"{unavailable} unavailable")
+        self.data_status = " · ".join(parts) + (" · R to retry" if failed else "")
+        self.render_view()
+
+    def render_view(self, rebuild: bool = True) -> None:
+        cal = self.query_one("#calendar", Container)
+        agenda = self.query_one("#agenda", Container)
+        stage = self.query_one("#stage", Container)
+        width, height = self.size.width, max(0, self.size.height - (3 if self.size.height >= 6 else 2))
+        stage.set_class(self.size.height < 6, "cramped")
+        # Wide: calendar >=36, agenda >=55 (48 usable). Stacked: 16+8 rows.
+        self.layout_mode = ("wide" if width >= 91 and height >= 16 else
+                            "stacked" if width >= 36 and height >= 24 else "compact")
+        for mode in ("wide", "stacked", "compact"):
+            stage.set_class(mode == self.layout_mode, mode)
+        stage.set_class(height < 16, "tiny")
+        combined = self.layout_mode != "compact"
+        cal.display = combined or self.view == "calendar"
+        agenda.display = combined or self.view == "agenda"
+        if cal.display:
+            self.render_calendar()
+        if agenda.display:
+            if rebuild and self.query_one("#agenda-body").content_size.width:
+                self.rebuild_pages()
+            self.query_one("#agenda-body", Static).update(
+                self.pages[self.page] if self.pages else "No events")
+            self.schedule_reflow()
+        instructions = ("←→ Month · ↑↓ Page · T Today · S Settings · R Refresh · Q Quit" if combined else
+                        "C Calendar · A Agenda · " +
+                        ("←→ Month" if self.view == "calendar" else "↑↓ Page") +
+                        " · T Today · S Settings · R Refresh · Q Quit")
+        if len(instructions) > width:
+            instructions = ("←→ Month ↑↓ Page T Today S Settings R Refresh Q Quit" if combined else
+                            "C/A View ←→ Month ↑↓ Page S Settings T R Q")
+        if len(instructions) > width:
+            instructions = "Q C/A ←→ ↑↓ S Settings" if width >= 24 else "Q C A T R S" if width >= 11 else "Q S C A"
+        self.query_one("#status", Static).update(shorten(self.data_status, width))
+        self.query_one("#keys", Static).update(shorten(instructions, width))
+
+    def render_calendar(self) -> None:
+        today = date.today()
+        first = self.month
+        last = month_shift(first, 1)
+        marked: set[date] = set()
+        if self.feed_query is not None:
+            try:
+                begin, end = self.settings.window()
+                begin, end = max(first, begin), min(last, end)
+                if begin < end:
+                    for day, _ in day_groups(parse_appointments(self.feed_query, begin, end), begin, end):
+                        marked.add(day)
+            except Exception:
+                self.data_status = "Some calendar events could not be read"
+        self.query_one("#month", Static).update("‹   " + first.strftime("%B %Y") + "   ›")
+        start_offset = first.weekday()
+        cells = self.query(".day")
+        length = monthlib.monthrange(first.year, first.month)[1]
+        for i, cell in enumerate(cells):
+            n = i - start_offset + 1
+            active = 1 <= n <= length
+            cell.day = first.replace(day=n) if active else None
+            cell.set_class(bool(active and cell.day == today), "today")
+            cell.set_class(bool(active and cell.day in marked), "has-event")
+            if self.palette:
+                colors = self._text_colors
+                cell.styles.color = hex_color(colors["selection"] if cell.has_class("today") else
+                                              colors["accent"] if cell.has_class("has-event") else colors["primary"])
+            if active:
+                cell.update(f"{n:2d}" + ("\n•" if cell.day in marked else ""))
+            else:
+                cell.update("")
+
+    def rebuild_pages(self) -> None:
+        size = self.query_one("#agenda-body", Static).content_size
+        width, height = size.width, size.height
+        if self._reset_position:
+            self._page_position = None
+        elif self.page < len(self.page_starts):
+            self._page_position = self.page_starts[self.page]
+        previous = self._page_position
+        if width < 24 or height < 3:
+            self.pages = agenda_pages([], height, width, secondary=self.secondary, accent=self.accent)
+            self.page_starts = []
+            self.page = 0
+            self._reset_position = False
+            return
+        self.page_starts = []
+        if self.feed_query is None:
+            self._reset_position = False
+            self.pages = [Text("No calendar loaded", style=self.secondary)]
+            self.page = 0
+            return
+        try:
+            begin, end = self.settings.window()
+            events = parse_appointments(self.feed_query, begin, end)
+            groups = day_groups(events, begin, end)
+
+            # The selected day must be the start of the initial agenda page.
+            # Keep earlier appointments as preceding pages, rather than
+            # throwing them away as the original forward-only viewer did.
+            earlier = [g for g in groups if g[0] < self.anchor]
+            onward = [g for g in groups if g[0] >= self.anchor]
+            earlier_pages = agenda_pages(earlier, height, width, self.page_starts, self.secondary, self.accent) if earlier else []
+            onward_pages = agenda_pages(onward, height, width, self.page_starts, self.secondary, self.accent)
+            self.pages = earlier_pages + onward_pages
+            anchor_page = len(earlier_pages)
+            self.page = max(0, min(anchor_page + self.page_offset, len(self.pages) - 1))
+            if previous is not None and self.page_starts:
+                self.page = max((i for i, start in enumerate(self.page_starts)
+                                 if start <= previous), default=0)
+            self.page_offset = self.page - anchor_page
+            self._reset_position = False
+        except Exception:
+            self.pages = [Text("Could not read agenda events", style=self.secondary)]
+            self.page = 0
+
+
+def main() -> None:
+    cli = argparse.ArgumentParser(description="Small read-only calendar and agenda TUI")
+    cli.add_argument("--demo", action="store_true", help="Show sample events without a subscription")
+    cli.add_argument("-a", "--agenda", action="store_true", help="Start in agenda view")
+    output = cli.add_mutually_exclusive_group()
+    output.add_argument("--next", action="store_true", help="Print the next future timed event as JSON")
+    output.add_argument("--waybar", action="store_true", help="Print the next timed event as Waybar JSON")
+    cli.add_argument("--within", type=positive_minutes, metavar="N",
+                     help="With --next or --waybar, limit the start time to N minutes from now")
+    args = cli.parse_args()
+    if args.within is not None and not (args.next or args.waybar):
+        cli.error("--within requires --next or --waybar")
+    if args.next or args.waybar:
+        try:
+            query = next_feed(demo=args.demo)
+            now = datetime.now(LOCAL_TZ)
+            result = next_event(query, now, args.within)
+            if args.waybar:
+                result = waybar_event(result, now.date())
+        except Exception as error:
+            print(f"calTUI: Calendar unavailable: {error}", file=sys.stderr)
+            if args.waybar:
+                print(json.dumps({"text": "", "tooltip": "Calendar unavailable; check the feed configuration and cache",
+                                  "class": "error"}))
+                return
+            print(json.dumps({"date": "", "time": "", "description": "", "location": ""}))
+            raise SystemExit(1)
+        print(json.dumps(result, ensure_ascii=False))
+        return
+    CalTUI(demo=args.demo, agenda=args.agenda).run()
+
+if __name__ == "__main__":
+    main()
