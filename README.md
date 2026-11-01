@@ -19,7 +19,7 @@ Sometimes you don't need to manage your calendar. You just need to read the damn
 
 ## Features
 
-- Responsive calendar and agenda: side-by-side, stacked, or a single view as terminal dimensions allow.
+- Responsive calendar and agenda in independent, subtle rounded panels: side-by-side, stacked, or a single view as terminal dimensions allow.
 - A unified agenda from multiple ICS subscriptions, with independent caches.
 - Recurring events, exceptions, cancellations, time zones, all-day and multiday appointments.
 - Cached calendars displayed immediately, nonblocking TUI refreshes, and offline fallback.
@@ -169,6 +169,18 @@ its corresponding arrows navigate that view. Click a calendar date to start the
 agenda there. The agenda is paginated and doesn't open event details or edit
 anything. That would be dangerously productive.
 
+The calendar stays content-sized (18 rows including its border and six calendar
+weeks); the agenda fills the remaining height and paginates inside its border.
+Wide layouts top-align the panels with a one-column gap, leaving unused space
+below the calendar outside its border. Stacked layouts use a one-row gap. The
+application footer stays outside both panels. Pagination uses the agenda's actual
+content region, and long date headings are ellipsized to fit.
+
+With the normal footer spacing, side-by-side mode needs at least 91×21 cells;
+stacked mode needs at least 36×32. Other sizes use the existing single-view
+controls. Framing is omitted where a small view cannot accommodate it; terminal
+palette changes update the muted border colors along with the text.
+
 ## Command-line integration
 
 ```sh
@@ -239,7 +251,7 @@ Waybar's interval is in **seconds**, while calTUI's freshness setting is in
 From the repository root, with the runtime dependencies installed:
 
 ```sh
-PYTHONPATH=tests python -m unittest test_multifeed test_settings test_config_range test_waybar
+PYTHONPATH=tests python -m unittest test_multifeed test_settings test_config_range test_waybar test_panels
 python tests/test_layout.py
 python tests/test_contrast.py
 # Linux PTY integration checks:

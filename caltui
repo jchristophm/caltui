@@ -649,6 +649,7 @@ def agenda_pages(groups: list[tuple[date, list[Appointment]]], height: int, widt
             if heading_needed:
                 suffix = " (cont.)" if index > 0 else ""
                 heading = Text(day.strftime("%A, %B %-d") + suffix, style="bold " + accent)
+                heading.truncate(width, overflow="ellipsis")
                 current.append(heading)
                 used += 1
             current.extend(lines)
@@ -690,6 +691,7 @@ class CalTUI(App):
              overflow: hidden; background: ansi_default; padding-bottom: 1; }
     #stage.cramped { padding-bottom: 0; }
     #calendar { width: 100%; max-width: 100%; height: 16; background: ansi_default; }
+    #calendar.framed { height: 18; padding: 0 1; }
     #month { width: 100%; height: 3; content-align: center middle;
              color: ansi_cyan; text-style: bold; }
     #weekdays { layout: grid; grid-size: 7 1; grid-columns: 1fr;
@@ -705,13 +707,16 @@ class CalTUI(App):
     .day:hover { text-style: bold; }
     #agenda { width: 100%; height: 100%; align: center middle;
               overflow: hidden; background: ansi_default; }
+    #agenda.framed { padding: 0 1; }
+    #agenda.framed #agenda-body { width: 100%; }
     #agenda-body { width: 88%; height: 100%; content-align: left middle;
                    overflow: hidden;
                    background: ansi_default; color: ansi_default; }
-    #stage.wide { layout: horizontal; }
-    #stage.wide #calendar { width: 2fr; height: 16; }
+    #stage.wide { layout: horizontal; align: center top; }
+    #stage.wide #calendar { width: 2fr; margin-right: 1; }
     #stage.wide #agenda { width: 3fr; height: 100%; }
-    #stage.stacked { layout: vertical; }
+    #stage.stacked { layout: vertical; align: center top; }
+    #stage.stacked #calendar { margin-bottom: 1; }
     #stage.stacked #agenda { height: 1fr; }
     #stage.compact #calendar { max-height: 100%; }
     #stage.tiny #month { height: 1; }
@@ -733,6 +738,7 @@ class CalTUI(App):
         self.view = "agenda" if agenda else "calendar"
         self.layout_mode = "compact"
         self._agenda_size = None
+        self._panel_style = None
         self._reflow_pending = False
         self.page_starts = []
         self._page_position = None
@@ -1013,12 +1019,25 @@ class CalTUI(App):
         stage = self.query_one("#stage", Container)
         width, height = self.size.width, max(0, self.size.height - (3 if self.size.height >= 6 else 2))
         stage.set_class(self.size.height < 6, "cramped")
-        # Wide: calendar >=36, agenda >=55 (48 usable). Stacked: 16+8 rows.
-        self.layout_mode = ("wide" if width >= 91 and height >= 16 else
-                            "stacked" if width >= 36 and height >= 24 else "compact")
+        # The framed calendar needs 16 content rows + 2 border rows. Stacked
+        # adds a one-row gap and an agenda with at least 8 content + 2 border rows.
+        self.layout_mode = ("wide" if width >= 91 and height >= 18 else
+                            "stacked" if width >= 36 and height >= 29 else "compact")
         for mode in ("wide", "stacked", "compact"):
             stage.set_class(mode == self.layout_mode, mode)
         stage.set_class(height < 16, "tiny")
+        calendar_framed = width >= 32 and height >= 18
+        agenda_height = height - 19 if self.layout_mode == "stacked" else height
+        agenda_framed = width >= 28 and agenda_height >= 5
+        cal.set_class(calendar_framed, "framed")
+        agenda.set_class(agenda_framed, "framed")
+        border = (hex_color(blend(self.palette["11"], self._text_colors["primary"], 96))
+                  if self.palette else "ansi_bright_black")
+        panel_style = (calendar_framed, agenda_framed, border)
+        if panel_style != self._panel_style:
+            self._panel_style = panel_style
+            for panel, framed in ((cal, calendar_framed), (agenda, agenda_framed)):
+                panel.styles.border = ("round" if framed else "none", border)
         combined = self.layout_mode != "compact"
         cal.display = combined or self.view == "calendar"
         agenda.display = combined or self.view == "agenda"
