@@ -154,7 +154,9 @@ without `--demo` require a configured calendar.
 
 | Key | Action |
 | --- | --- |
-| `←` / `→` | Previous / next month |
+| `←` / `→` | Select previous / next day |
+| `Shift+←` / `Shift+→` | Previous / next month, clamping the selected day |
+| `Enter` | Open agenda for the highlighted date |
 | `↑` / `↓` | Previous / next agenda page |
 | `c` | Calendar view |
 | `a` | Agenda view |
@@ -163,11 +165,13 @@ without `--demo` require a configured calendar.
 | `r` | Force subscription refresh |
 | `q` | Quit |
 
-When both panels are visible, left/right navigate months and up/down page the
-agenda. No focus juggling required. In compact mode, select a view with `c` or `a`;
-its corresponding arrows navigate that view. Click a calendar date to start the
-agenda there. The agenda is paginated and doesn't open event details or edit
-anything. That would be dangerously productive.
+Left/right move the underlined calendar selection, crossing months automatically.
+Shift+left/right change months while retaining the day number where possible.
+Today keeps its colored background when another day is selected. Moving the
+highlight leaves the agenda unchanged until Enter; clicking a date selects it
+and opens its agenda immediately. T resets both the calendar and agenda to today.
+Up/down continue paging the agenda. In compact mode, calendar navigation is
+active only in calendar view; choose views with `c` or `a`.
 
 The calendar stays content-sized (18 rows including its border and six calendar
 weeks); the agenda fills the remaining height and paginates inside its border.

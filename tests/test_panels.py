@@ -35,6 +35,42 @@ class Panels(unittest.TestCase):
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
 
+    def test_calendar_keyboard_selection(self):
+        async def check():
+            app = PanelProbe()
+            with patch.object(PanelProbe, "load_weather"):
+                async with app.run_test(size=(120, 35)) as pilot:
+                    await pilot.pause()
+                    self.assertEqual(app.selected, date.today())
+                    anchor, pages = app.anchor, list(app.pages)
+                    app.selected = date(2024, 1, 31)
+                    app.month = date(2024, 1, 1)
+                    await pilot.press("right")
+                    self.assertEqual(app.selected, date(2024, 2, 1))
+                    self.assertEqual(app.month, date(2024, 2, 1))
+                    await pilot.press("left", "shift+right")
+                    self.assertEqual(app.selected, date(2024, 2, 29))
+                    await pilot.press("shift+right", "shift+left")
+                    self.assertEqual(app.selected, date(2024, 2, 29))
+                    self.assertEqual(app.anchor, anchor)
+                    self.assertEqual(app.pages, pages)
+                    self.assertEqual(sum(c.has_class("selected") for c in app.query(".day")), 1)
+                    await pilot.press("enter")
+                    self.assertEqual(app.anchor, app.selected)
+                    cell = next(c for c in app.query(".day") if c.day == date(2024, 2, 12))
+                    await pilot.click(cell)
+                    self.assertEqual(app.selected, date(2024, 2, 12))
+                    self.assertEqual(app.anchor, app.selected)
+                    await pilot.press("t")
+                    self.assertEqual(app.selected, date.today())
+                    self.assertEqual(app.month, date.today().replace(day=1))
+                    await pilot.resize_terminal(60, 20)
+                    await pilot.press("a")
+                    selected = app.selected
+                    await pilot.press("left", "right", "shift+right", "enter")
+                    self.assertEqual(app.selected, selected)
+        run_ui(check())
+
     def assert_footer(self, app, height):
         status, keys = app.query_one("#status"), app.query_one("#keys")
         self.assertEqual(keys.region.bottom, height)

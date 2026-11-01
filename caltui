@@ -680,8 +680,11 @@ class CalTUI(App):
         ("q", "quit", "Quit"), ("c", "calendar", "Calendar"),
         ("a", "agenda", "Agenda"), ("t", "today", "Today"),
         ("r", "refresh_feed", "Refresh"), ("s", "settings", "Settings"),
-        ("left", "previous_month", "Previous Month"),
-        ("right", "next_month", "Next Month"),
+        ("left", "previous_day", "Previous Day"),
+        ("shift+left", "previous_month", "Previous Month"),
+        ("right", "next_day", "Next Day"),
+        ("shift+right", "next_month", "Next Month"),
+        ("enter", "selected_agenda", "Open Selected Date"),
         ("up", "previous_page", "Previous Page"),
         ("down", "next_page", "Next Page"),
     ]
@@ -706,6 +709,7 @@ class CalTUI(App):
     .day.has-event { color: ansi_cyan; }
     .day.today { color: ansi_bright_white; background: ansi_blue;
                  text-style: bold; }
+    .day.selected, .day.selected:hover { text-style: bold underline; }
     .day:hover { text-style: bold; }
     #agenda { width: 100%; height: 100%; align: center middle;
               overflow: hidden; background: ansi_default; }
@@ -749,6 +753,7 @@ class CalTUI(App):
         self._reset_position = True
         self.month = date.today().replace(day=1)
         self.anchor = date.today()
+        self.selected = self.anchor
         self.feed_query = None
         self.pages: list[Text] = []
         self.page = 0
@@ -861,7 +866,7 @@ class CalTUI(App):
             self.view = "calendar"
             return
         if self.view == "agenda":
-            self.month = self.anchor.replace(day=1)
+            self.month = self.selected.replace(day=1)
         self.view = "calendar"
         self.render_view()
 
@@ -876,6 +881,7 @@ class CalTUI(App):
             self.open_agenda(self.anchor)
 
     def open_agenda(self, day: date) -> None:
+        self.selected = day
         self.anchor = day
         if self.layout_mode == "compact":
             self.view = "agenda"
@@ -885,20 +891,39 @@ class CalTUI(App):
 
     def action_today(self) -> None:
         self.anchor = date.today()
+        self.selected = self.anchor
         self.month = self.anchor.replace(day=1)
         self.page_offset = 0
         self._reset_position = True
         self.render_view()
 
+    def move_selection(self, days: int = 0, months: int = 0) -> None:
+        if self.layout_mode == "compact" and self.view != "calendar":
+            return
+        if months:
+            first = month_shift(self.selected, months)
+            self.selected = first.replace(day=min(self.selected.day,
+                monthlib.monthrange(first.year, first.month)[1]))
+        else:
+            self.selected += timedelta(days=days)
+        self.month = self.selected.replace(day=1)
+        self.render_view(rebuild=False)
+
+    def action_previous_day(self) -> None:
+        self.move_selection(days=-1)
+
+    def action_next_day(self) -> None:
+        self.move_selection(days=1)
+
     def action_previous_month(self) -> None:
-        if self.layout_mode != "compact" or self.view == "calendar":
-            self.month = month_shift(self.month, -1)
-            self.render_view()
+        self.move_selection(months=-1)
 
     def action_next_month(self) -> None:
+        self.move_selection(months=1)
+
+    def action_selected_agenda(self) -> None:
         if self.layout_mode != "compact" or self.view == "calendar":
-            self.month = month_shift(self.month, 1)
-            self.render_view()
+            self.open_agenda(self.selected)
 
     def action_previous_page(self) -> None:
         if (self.layout_mode != "compact" or self.view == "agenda") and self.page > 0:
@@ -1057,13 +1082,13 @@ class CalTUI(App):
             self.query_one("#agenda-body", Static).update(
                 self.pages[self.page] if self.pages else "No events")
             self.schedule_reflow()
-        instructions = ("←→ Month · ↑↓ Page · T Today · S Settings · R Refresh · Q Quit" if combined else
+        instructions = ("←→ Day Shift+←→ Month Enter Open · ↑↓ Page · T Today · S Settings · R Refresh · Q Quit" if combined else
                         "C Calendar · A Agenda · " +
-                        ("←→ Month" if self.view == "calendar" else "↑↓ Page") +
+                        ("←→ Day Shift+←→ Month Enter Open" if self.view == "calendar" else "↑↓ Page") +
                         " · T Today · S Settings · R Refresh · Q Quit")
         if len(instructions) > width:
-            instructions = ("←→ Month ↑↓ Page T Today S Settings R Refresh Q Quit" if combined else
-                            "C/A View ←→ Month ↑↓ Page S Settings T R Q")
+            instructions = ("←→ Day ⇧←→ Month Enter Open ↑↓ Page T Today S Settings R Q" if combined else
+                            "C/A View ←→ Day ⇧←→ Month Enter Open ↑↓ Page T R S Q")
         if len(instructions) > width:
             instructions = "Q C/A ←→ ↑↓ S Settings" if width >= 24 else "Q C A T R S" if width >= 11 else "Q S C A"
         self.query_one("#status", Static).update(shorten(self.data_status, width))
@@ -1137,6 +1162,7 @@ class CalTUI(App):
             active = 1 <= n <= length
             cell.day = first.replace(day=n) if active else None
             cell.set_class(bool(active and cell.day == today), "today")
+            cell.set_class(bool(active and cell.day == self.selected), "selected")
             cell.set_class(bool(active and cell.day in marked), "has-event")
             if self.palette:
                 colors = self._text_colors

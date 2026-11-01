@@ -13,7 +13,7 @@ async def test():
    if mode!='compact':
     assert app.query_one('#calendar').display and app.query_one('#agenda').display
     assert app.query_one('#agenda-body').content_size==app._agenda_size
-  await pilot.press('right'); await pilot.pause()
+  await pilot.press('shift+right'); await pilot.pause()
   assert app.month==m['month_shift'](m['date'].today().replace(day=1),1)
   month=app.month
   await pilot.press('a','c'); assert app.month==month
