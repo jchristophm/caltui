@@ -165,9 +165,9 @@ without `--demo` require a configured calendar.
 | `r` | Force subscription refresh |
 | `q` | Quit |
 
-Left/right move the underlined calendar selection, crossing months automatically.
+Left/right move the highlighted calendar selection, crossing months automatically.
 Shift+left/right change months while retaining the day number where possible.
-Today keeps its colored background when another day is selected. Moving the
+Only the selected date has a solid, terminal-palette-aware highlight. Moving the
 highlight leaves the agenda unchanged until Enter; clicking a date selects it
 and opens its agenda immediately. T resets both the calendar and agenda to today.
 Up/down continue paging the agenda. In compact mode, calendar navigation is

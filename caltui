@@ -707,9 +707,7 @@ class CalTUI(App):
     .day { width: 100%; height: 100%; content-align: center middle;
            background: ansi_default; color: ansi_default; }
     .day.has-event { color: ansi_cyan; }
-    .day.today { color: ansi_bright_white; background: ansi_blue;
-                 text-style: bold; }
-    .day.selected, .day.selected:hover { text-style: bold underline; }
+    .day.selected, .day.selected:hover { text-style: bold; }
     .day:hover { text-style: bold; }
     #agenda { width: 100%; height: 100%; align: center middle;
               overflow: hidden; background: ansi_default; }
@@ -1140,7 +1138,6 @@ class CalTUI(App):
             weather.update(self._weather)
 
     def render_calendar(self) -> None:
-        today = date.today()
         first = self.month
         last = month_shift(first, 1)
         marked: set[date] = set()
@@ -1161,13 +1158,14 @@ class CalTUI(App):
             n = i - start_offset + 1
             active = 1 <= n <= length
             cell.day = first.replace(day=n) if active else None
-            cell.set_class(bool(active and cell.day == today), "today")
             cell.set_class(bool(active and cell.day == self.selected), "selected")
             cell.set_class(bool(active and cell.day in marked), "has-event")
             if self.palette:
                 colors = self._text_colors
-                cell.styles.color = hex_color(colors["selection"] if cell.has_class("today") else
+                cell.styles.color = hex_color(colors["selection"] if cell.has_class("selected") else
                                               colors["accent"] if cell.has_class("has-event") else colors["primary"])
+                cell.styles.background = (hex_color(self.palette["4;4"])
+                                          if cell.has_class("selected") else "ansi_default")
             if active:
                 cell.update(f"{n:2d}" + ("\n•" if cell.day in marked else ""))
             else:
