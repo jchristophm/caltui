@@ -24,14 +24,18 @@ Sometimes you don't need to manage your calendar. You just need to read the damn
 - Recurring events, exceptions, cancellations, time zones, all-day and multiday appointments.
 - Cached calendars displayed immediately, nonblocking TUI refreshes, and offline fallback.
 - Automatic terminal color inheritance and WCAG AA text contrast adjustment (4.5:1) when the terminal reports its palette.
-- Keyboard navigation and clickable calendar dates.
+- Day-by-day keyboard selection with a terminal-theme-aware highlight, plus clickable calendar dates.
+- Optional current weather beneath the calendar in wide layouts, using wttr.is's own terminal artwork.
 - JSON CLI for scripts and native Waybar JSON integration.
 - No background service. It reads calendars when you run it. Revolutionary restraint.
 
 ## Screenshots
 
-Screenshots will go here. None are included yet; run `caltui --demo` to see the
-actual interface in your own terminal, with your own colors.
+![calTUI with independently bordered calendar and agenda panes, a selected date, and inline weather](assets/caltui-screenshot.png)
+
+The real application in Foot, with sample events and current weather. Run
+`caltui --demo` to see it with your own terminal colors. No artistic license
+required.
 
 ## Requirements
 
@@ -43,6 +47,11 @@ list of direct third-party dependencies is:
 - **recurring-ical-events**
 - **python-dateutil**
 - **rich**
+
+`curl` on your `PATH` and network access to `https://wttr.is` are needed only
+for optional inline weather. Missing curl or a failed request simply hides the
+report; the calendar and agenda carry on without a meteorological opinion.
+No weather library or configuration is required.
 
 An interactive terminal is needed for the TUI; Waybar is optional. Linux is the
 tested platform. The custom terminal color-query/input integration and PTY tests
@@ -160,14 +169,17 @@ without `--demo` require a configured calendar.
 | `↑` / `↓` | Previous / next agenda page |
 | `c` | Calendar view |
 | `a` | Agenda view |
-| `t` | Return to today |
+| `t` | Reset the selection, displayed month, and agenda to today |
 | `s` | Open configuration in your terminal editor |
-| `r` | Force subscription refresh |
+| `r` | Force subscription refresh; refresh weather in wide mode |
 | `q` | Quit |
+| Click a calendar date | Select the date and open its agenda |
 
 Left/right move the highlighted calendar selection, crossing months automatically.
-Shift+left/right change months while retaining the day number where possible.
-Only the selected date has a solid, terminal-palette-aware highlight. Moving the
+Shift+left/right change months while retaining the day number where possible,
+clamping to the last day of shorter months. The initial selection is today.
+Only the selected date has a solid, terminal-palette-aware highlight with a
+contrasting foreground; today has no separate styling when unselected. Moving the
 highlight leaves the agenda unchanged until Enter; clicking a date selects it
 and opens its agenda immediately. T resets both the calendar and agenda to today.
 Up/down continue paging the agenda. In compact mode, calendar navigation is
@@ -190,6 +202,9 @@ the calendar, centered without a border. It is fetched asynchronously once when
 needed with `curl -fsS --max-time 4 'https://wttr.is/?0nq'`; `r` can refresh it too.
 Weather is hidden if the complete report cannot fit, in stacked/compact layouts,
 or when the request fails. Resizing never refetches it or reduces panel space.
+The report keeps its original artwork, line breaks, and colors, with a blank row
+below the calendar border. It is an optional TUI extra; `--next` and `--waybar`
+continue reporting calendar events only.
 
 ## Command-line integration
 
