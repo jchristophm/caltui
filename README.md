@@ -1,5 +1,7 @@
 # calTUI
 
+![calTUI with independently bordered calendar and agenda panes, a selected date, and inline weather](assets/caltui-screenshot.png)
+
 **A calendar that knows its place.**
 
 Can you create events? Nope.
@@ -10,12 +12,25 @@ Can you cancel that meeting you really don't want to attend? Unfortunately not.
 
 But can you see what's on your calendar? Absolutely.
 
-calTUI is a small, read-only terminal calendar and agenda. Give it an ICS
-subscription, and it'll tell you what's coming up. No browser, no background
-daemon, no elaborate account setup, and no fifteen different screens for
-something you mostly just want to look at.
+Why keep a browser-based calendar application, its rendering engine, synchronization machinery, and all its supporting processes running just to answer, "What's next?" calTUI can read an .ics feed, parse the events, display them using the terminal's existing colors, and exit. Waybar can request the next appointment without keeping the entire TUI running.
 
 Sometimes you don't need to manage your calendar. You just need to read the damn thing.
+
+## Motivation
+
+**"What's on my calendar?"**
+
+Most of the time, I'm not creating appointments, rescheduling meetings, or organizing my life. I'm just looking.
+
+That ought to be simple. But enterprise IT departments increasingly lock down access to institutional calendars, restricting third-party clients and requiring administrator approval for applications that want to access or manage your calendar.
+
+I don't need any of that. I'm not trying to manage my calendar. I just want to see what's on it.
+
+An ICS subscription gives me exactly what I need: read-only access to my schedule, without OAuth, administrator approval for another application, or an elaborate calendar integration. Give calTUI a couple of subscription URLs, and it combines my personal and work calendars into one lightweight terminal calendar and agenda.
+
+When I actually need to manage an appointment, I'll open the appropriate application.
+
+Until then, I just want to know when my next meeting is without launching half the internet.
 
 ## Features
 
@@ -28,10 +43,6 @@ Sometimes you don't need to manage your calendar. You just need to read the damn
 - Optional current weather beneath the calendar in wide layouts, using wttr.is's own terminal artwork.
 - JSON CLI for scripts and native Waybar JSON integration.
 - No background service. It reads calendars when you run it. Revolutionary restraint.
-
-## Screenshots
-
-![calTUI with independently bordered calendar and agenda panes, a selected date, and inline weather](assets/caltui-screenshot.png)
 
 The real application in Foot, with sample events and current weather. Run
 `caltui --demo` to see it with your own terminal colors. No artistic license
