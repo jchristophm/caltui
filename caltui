@@ -690,6 +690,8 @@ class CalTUI(App):
     #stage { height: 1fr; width: 100%; align: center middle;
              overflow: hidden; background: ansi_default; padding-bottom: 1; }
     #stage.cramped { padding-bottom: 0; }
+    #weather { display: none; position: absolute; overlay: screen;
+               text-wrap: nowrap; overflow: hidden; background: ansi_default; }
     #calendar { width: 100%; max-width: 100%; height: 16; background: ansi_default; }
     #calendar.framed { height: 18; padding: 0 1; }
     #month { width: 100%; height: 3; content-align: center middle;
@@ -739,6 +741,8 @@ class CalTUI(App):
         self.layout_mode = "compact"
         self._agenda_size = None
         self._panel_style = None
+        self._weather = None
+        self._weather_requested = False
         self._reflow_pending = False
         self.page_starts = []
         self._page_position = None
@@ -767,6 +771,7 @@ class CalTUI(App):
                         yield DayCell()
             with Container(id="agenda"):
                 yield AgendaBody("", id="agenda-body")
+            yield Static("", id="weather", markup=False)
         yield Static("", id="status")
         yield Static("", id="keys")
 
@@ -951,6 +956,9 @@ class CalTUI(App):
             self.load_feed(stale_only=True)
 
     def action_refresh_feed(self) -> None:
+        if self.layout_mode == "wide":
+            self._weather_requested = False
+            self.call_after_refresh(self.render_weather)
         if self.demo:
             self.data_status = "Sample events · demo mode"
             self.render_view()
@@ -1060,6 +1068,51 @@ class CalTUI(App):
             instructions = "Q C/A ←→ ↑↓ S Settings" if width >= 24 else "Q C A T R S" if width >= 11 else "Q S C A"
         self.query_one("#status", Static).update(shorten(self.data_status, width))
         self.query_one("#keys", Static).update(shorten(instructions, width))
+        self.call_after_refresh(self.render_weather)
+
+    @work(exclusive=True, group="weather")
+    async def load_weather(self) -> None:
+        process, report = None, None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "curl", "-fsS", "--max-time", "4", "https://wttr.is/?0nq",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            output, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+            if process.returncode == 0 and len(output) <= 16384:
+                report = Text.from_ansi(output.decode("utf-8").rstrip("\r\n"))
+                plain = report.plain
+                if (not plain.strip() or plain.lstrip().startswith("<") or
+                        any((ord(c) < 32 and c != "\n") or 127 <= ord(c) < 160 for c in plain)):
+                    report = None
+        except (OSError, ValueError, asyncio.TimeoutError):
+            pass
+        finally:
+            if process is not None and process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+        self._weather = report
+        self.call_after_refresh(self.render_weather)
+
+    def render_weather(self) -> None:
+        weather = self.query_one("#weather", Static)
+        cal, stage = self.query_one("#calendar"), self.query_one("#stage")
+        available = stage.content_region.bottom - cal.region.bottom - 1
+        possible = self.layout_mode == "wide" and cal.region.width > 0 and available > 0
+        if possible and not self._weather_requested:
+            self._weather_requested = True
+            self.load_weather()
+        lines = self._weather.split("\n") if self._weather is not None else []
+        width = max((line.cell_len for line in lines), default=0)
+        fits = possible and len(lines) >= 2 and width > 0 and width <= cal.region.width and len(lines) <= available
+        weather.display = fits
+        if fits:
+            weather.styles.width, weather.styles.height = width, len(lines)
+            weather.styles.offset = (cal.region.x - stage.content_region.x + (cal.region.width - width) // 2,
+                                     cal.region.bottom - stage.content_region.y + 1)
+            weather.update(self._weather)
 
     def render_calendar(self) -> None:
         today = date.today()

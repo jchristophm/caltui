@@ -3,7 +3,10 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+import asyncio
+from rich.text import Text
 
 from rich.cells import cell_len
 from test_multifeed import m, g, run_ui
@@ -183,6 +186,54 @@ class Panels(unittest.TestCase):
                 await pilot.resize_terminal(120, 35)
                 await pilot.pause()
                 self.assertEqual(tuple(app.query_one("#calendar").styles.border_top[1].rgb), border_colors[-1])
+        run_ui(check())
+
+    def test_optional_weather_fits_without_changing_panels(self):
+        async def check():
+            worker = m["CalTUI"].load_weather.__wrapped__
+            with patch.object(m["CalTUI"], "load_weather") as fetch:
+                app = PanelProbe()
+                async with app.run_test(size=(120, 35)) as pilot:
+                    await pilot.pause()
+                    cal, agenda = app.query_one("#calendar"), app.query_one("#agenda")
+                    regions = (cal.region, agenda.region, app.query_one("#status").region)
+                    report = Text.from_ansi("\x1b[33mExample location\x1b[0m\n\n  \u2600  Clear")
+                    app._weather = report
+                    app.render_weather()
+                    await pilot.pause()
+                    weather = app.query_one("#weather")
+                    self.assertTrue(weather.display)
+                    self.assertEqual((cal.region, agenda.region, app.query_one("#status").region), regions)
+                    self.assertEqual(weather.region.y, cal.region.bottom + 1)
+                    self.assertEqual(weather.region.x, cal.region.x + (cal.region.width - weather.region.width) // 2)
+                    self.assertEqual(weather.styles.border_top[0], "")
+                    self.assertTrue(report.spans)
+                    app._weather = Text("界" * 30 + "\nToo wide")
+                    app.render_weather()
+                    self.assertFalse(weather.display)  # Cells, not rune/ANSI counts.
+                    app._weather = Text("line\n" * 20 + "Too tall")
+                    app.render_weather()
+                    self.assertFalse(weather.display)
+                    app._weather = report
+                    for size, visible in [((100, 24), False), ((60, 35), False),
+                                          ((60, 20), False), ((120, 35), True)]:
+                        await pilot.resize_terminal(*size)
+                        await pilot.pause()
+                        self.assertEqual(weather.display, visible)
+                    self.assertEqual(fetch.call_count, 1)
+                    await pilot.press("r")
+                    await pilot.pause()
+                    self.assertEqual(fetch.call_count, 2)
+                    process = SimpleNamespace(returncode=0, communicate=AsyncMock(return_value=(b"Place\n  clear\n", b"")))
+                    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)) as curl:
+                        await worker(app)
+                        curl.assert_awaited_once_with("curl", "-fsS", "--max-time", "4", "https://wttr.is/?0nq",
+                                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                    with patch("asyncio.create_subprocess_exec", new=AsyncMock(side_effect=FileNotFoundError)):
+                        await worker(app)
+                        await pilot.pause()
+                    self.assertIsNone(app._weather)
+                    self.assertFalse(weather.display)
         run_ui(check())
 
     def test_repeated_resize_settles(self):

@@ -181,6 +181,12 @@ stacked mode needs at least 36×32. Other sizes use the existing single-view
 controls. Framing is omitted where a small view cannot accommodate it; terminal
 palette changes update the muted border colors along with the text.
 
+Wide layouts may show the original ANSI-colored `wttr.is` weather artwork below
+the calendar, centered without a border. It is fetched asynchronously once when
+needed with `curl -fsS --max-time 4 'https://wttr.is/?0nq'`; `r` can refresh it too.
+Weather is hidden if the complete report cannot fit, in stacked/compact layouts,
+or when the request fails. Resizing never refetches it or reduces panel space.
+
 ## Command-line integration
 
 ```sh
