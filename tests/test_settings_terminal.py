@@ -55,7 +55,7 @@ Probe().run()
      try:rows.append(json.loads(line))
      except json.JSONDecodeError:pass
    if stage==0 and rows:
-    first=rows[-1];os.write(master,b'\x1b[C');stage=1
+    first=rows[-1];os.write(master,b'\x1b[1;2C');stage=1
    elif stage==1 and rows[-1]['month']!=first['month']:
     saved=rows[-1];os.write(master,b's');stage=2
    elif stage==2 and marker.exists() and marker.stat().st_size:
@@ -68,7 +68,7 @@ Probe().run()
     assert all(rows[-1][key]==saved[key] for key in ['month','anchor','view','layout'])
     os.write(master,b's');stage=4
    elif stage==4 and rows[-1]['settings']==2:
-    os.write(master,b'\x1b[C');stage=5
+    os.write(master,b'\x1b[1;2C');stage=5
    elif stage==5 and rows[-1]['month']!=saved['month']:
     os.write(master,b'q');stage=6
   proc.wait(timeout=3)

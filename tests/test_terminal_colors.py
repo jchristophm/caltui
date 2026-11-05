@@ -48,7 +48,7 @@ def run(initial, switch=False, supported=True):
    elapsed=time.monotonic()-begin
    if switch and elapsed>3: current=LIGHT
    if elapsed>1 and not pressed:
-    os.write(master,b'\x1b[C'); pressed=True
+    os.write(master,b'\x1b[1;2C'); pressed=True
    if elapsed>7 and not quit_sent:
     os.write(master,b'q');quit_sent=True
    readable,_,_=select.select([master],[],[],.05)

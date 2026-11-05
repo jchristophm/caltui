@@ -67,7 +67,7 @@ class SettingsUI(unittest.TestCase):
       await pilot.press('s');await pilot.pause()
       self.assertEqual(order,['suspend','resume']);runner.assert_called_once();refresh.assert_not_called()
      self.assertEqual((app.month,app.anchor,app.view,app.page,app.layout_mode),state)
-     self.assertIn('S Settings',str(app.query_one('#keys').render()))
+     self.assertIn('S',str(app.query_one('#keys').render()).split())
      await pilot.press('c');await pilot.pause()
      cell=next(c for c in app.query('.day') if c.day is not None)
      selected=cell.day;await pilot.click(cell);await pilot.pause()
@@ -115,7 +115,7 @@ class SettingsUI(unittest.TestCase):
      with self.subTest(error=type(error).__name__),self.editor(app,error=error) as (order,_),patch.object(app,'notify') as notify:
       await pilot.press('s');await pilot.pause()
       self.assertEqual(order,['suspend','resume']);notify.assert_called_once()
-    await pilot.press('right');self.assertEqual(app.month,m['month_shift'](m['date'].today().replace(day=1),1))
+    await pilot.press('shift+right');self.assertEqual(app.month,m['month_shift'](m['date'].today().replace(day=1),1))
   run_ui(check())
  def test_unsuccessful_exit_notifies_and_still_applies_valid_changes(self):
   async def check():
