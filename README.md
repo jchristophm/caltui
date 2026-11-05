@@ -40,6 +40,7 @@ Until then, I just want to know when my next meeting is without launching half t
 - Cached calendars displayed immediately, nonblocking TUI refreshes, and offline fallback.
 - Automatic terminal color inheritance and WCAG AA text contrast adjustment (4.5:1) when the terminal reports its palette.
 - Day-by-day keyboard selection with a terminal-theme-aware highlight, plus clickable calendar dates.
+- Clickable HTTP/HTTPS links in event locations, opening in your system default browser.
 - Optional current weather beneath the calendar in wide layouts, using wttr.is's own terminal artwork.
 - JSON CLI for scripts and native Waybar JSON integration.
 - No background service. It reads calendars when you run it. Revolutionary restraint.
@@ -167,8 +168,9 @@ working settings and appointments. calTUI never rewrites the configuration.
 The editor priority is `VISUAL`, then `EDITOR`, then `nano`, then `vi`.
 
 With no nonempty URLs, the interactive TUI automatically shows demo events.
-`--demo` explicitly selects sample data without subscription downloads. CLI queries
-without `--demo` require a configured calendar.
+`caltui --demo` explicitly selects sample data without subscription downloads,
+including a synthetic online meeting to try clickable links. CLI queries without
+`--demo` require a configured calendar.
 
 ## Keyboard and mouse
 
@@ -185,7 +187,7 @@ without `--demo` require a configured calendar.
 | `r` | Force subscription refresh; refresh weather in wide mode |
 | `q` | Quit |
 | Click a calendar date | Select the date and open its agenda |
-| Click an underlined location URL | Open the full HTTP/HTTPS URL in your default browser |
+| Click an underlined location URL | Open the full HTTP/HTTPS URL in your default browser; calTUI stays open |
 
 Left/right move the highlighted calendar selection, crossing months automatically.
 Shift+left/right change months while retaining the day number where possible,
