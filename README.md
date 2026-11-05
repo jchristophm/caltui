@@ -185,6 +185,7 @@ without `--demo` require a configured calendar.
 | `r` | Force subscription refresh; refresh weather in wide mode |
 | `q` | Quit |
 | Click a calendar date | Select the date and open its agenda |
+| Click an underlined location URL | Open the full HTTP/HTTPS URL in your default browser |
 
 Left/right move the highlighted calendar selection, crossing months automatically.
 Shift+left/right change months while retaining the day number where possible,
@@ -287,12 +288,13 @@ Waybar's interval is in **seconds**, while calTUI's freshness setting is in
 From the repository root, with the runtime dependencies installed:
 
 ```sh
-PYTHONPATH=tests python -m unittest test_multifeed test_settings test_config_range test_waybar test_panels
+PYTHONPATH=tests python -m unittest test_multifeed test_settings test_config_range test_waybar test_panels test_agenda_links
 python tests/test_layout.py
 python tests/test_contrast.py
 # Linux PTY integration checks:
 python tests/test_settings_terminal.py
 python tests/test_terminal_colors.py
+python tests/test_agenda_links_terminal.py
 ```
 
 Tests use synthetic calendars, temporary caches, and mocked network/time operations.

@@ -45,12 +45,15 @@ import sys
 import tempfile
 import time as clock
 import tomllib
+import webbrowser
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 from unicodedata import category
 
 from dateutil.tz import tzlocal
 from icalendar import Calendar
 import recurring_ical_events
+from rich.style import Style
 from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult, SuspendNotSupported
@@ -305,6 +308,8 @@ def demo_ics() -> bytes:
     examples = [
         (0, 9, 0, 60, "Faculty meeting", "Science Hall"),
         (0, 14, 30, 45, "Project review", "Conference room"),
+        (0, 16, 0, 30, "Online project sync (demo)",
+         "https://meet.example.invalid/join/project-sync?participant=demo%20guest&code=sample-only-1234567890"),
         (1, 10, 0, 90, "Committee meeting", ""),
         (1, 13, 0, 60, "Department planning", "Online"),
         (2, 8, 30, 60, "Morning check-in", ""),
@@ -588,6 +593,32 @@ def day_groups(items: list[Appointment], begin: date, stop: date) -> list[tuple[
     return sorted(dates.items())
 
 
+def valid_web_url(url: str) -> bool:
+    """Validate click targets without interpreting calendar text as commands."""
+    try:
+        parsed = urlsplit(url)
+        return (parsed.scheme.lower() in {"http", "https"} and bool(parsed.hostname)
+                and parsed.port != 0 and not any(c.isspace() or ord(c) < 32 for c in url)
+                and not any(c in url for c in "\\<>\""))
+    except ValueError:
+        return False
+
+
+def location_text(location: str, width: int, secondary: str) -> Text:
+    text = Text(location, style=secondary)
+    for match in re.finditer(r"(?<![\w:/])https?://[^\s<>\"]+", location, re.IGNORECASE):
+        url = match.group().rstrip(".,;:!?'")
+        # Keep balanced URL parentheses, but discard prose closing delimiters.
+        for opening, closing in (("(", ")"), ("[", "]"), ("{", "}")):
+            while url.endswith(closing) and url.count(closing) > url.count(opening):
+                url = url[:-1]
+        if valid_web_url(url):
+            text.stylize(Style(underline=True, meta={"meeting_url": url}),
+                         match.start(), match.start() + len(url))
+    text.truncate(max(1, width), overflow="ellipsis")
+    return text
+
+
 def event_line(item: Appointment, day: date, width: int, secondary: str = "bright_black") -> list[Text]:
     if item.all_day:
         when = "All day"
@@ -603,7 +634,7 @@ def event_line(item: Appointment, day: date, width: int, secondary: str = "brigh
     lines = [line]
     if item.location:
         detail = Text(" " * 11 + "↳ ", style=secondary)
-        detail.append_text(shorten(item.location, width - 13))
+        detail.append_text(location_text(item.location, width - 13, secondary))
         detail.stylize(secondary)
         lines.append(detail)
     return lines
@@ -670,6 +701,12 @@ class DayCell(Static):
 
 
 class AgendaBody(Static):
+    def on_click(self, event: events.Click) -> None:
+        url = event.style.meta.get("meeting_url")
+        if event.button == 1 and isinstance(url, str) and valid_web_url(url):
+            event.stop()
+            webbrowser.open(url)
+
     def on_resize(self) -> None:
         self.app.schedule_reflow()
 
